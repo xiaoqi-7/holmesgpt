@@ -15,6 +15,11 @@ toolsets:
   internet:
     enabled: true
   runbook:
-    enabled: true
+    enabled: false
   robusta:
-    enabled: true
+    enabled: false
+ 
+  aks/core:
+    enabled: false
+  aks/node-health:
+    enabled: false
