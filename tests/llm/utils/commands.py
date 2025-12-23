@@ -159,6 +159,7 @@ def _invoke_command(
             executable="/bin/bash",  # Force bash instead of default /bin/sh
             capture_output=True,
             text=True,
+            executable="/bin/bash",
             check=True,
             stdin=subprocess.DEVNULL,
             cwd=cwd,
