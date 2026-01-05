@@ -30,9 +30,14 @@ def is_rfc3339(timestamp_str: str) -> bool:
 
 
 def to_unix(timestamp_str: str) -> int:
-    dt = parser.parse(timestamp_str)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    if str(timestamp_str).strip().lower() == "now":
+        from datetime import datetime, timezone
+        dt = datetime.now(timezone.utc)
+    else:
+        dt = parser.parse(timestamp_str)
+        if dt.tzinfo is None:
+            import datetime as dtmod
+            dt = dt.replace(tzinfo=dtmod.timezone.utc)
     return int(dt.timestamp())
 
 
