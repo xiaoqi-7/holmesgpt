@@ -1,3 +1,0 @@
-- Normal bid rate should be around 10%
-- Problems with bid rate and traffic can change in a matter of seconds, use the highest resolution possible
-- The total bid request traffic should usually be consistent.
