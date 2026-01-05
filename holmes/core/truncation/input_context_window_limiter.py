@@ -6,7 +6,6 @@ from pydantic import BaseModel
 
 from holmes.common.env_vars import (
     ENABLE_CONVERSATION_HISTORY_COMPACTION,
-    MAX_OUTPUT_TOKEN_RESERVATION,
 )
 from holmes.core.llm import (
     LLM,
@@ -15,6 +14,7 @@ from holmes.core.llm import (
 )
 from holmes.core.models import TruncationMetadata, TruncationResult
 from holmes.core.truncation.compaction import compact_conversation_history
+from holmes.core.truncation.message_truncation import truncate_messages_to_fit_context
 from holmes.utils import sentry_helper
 from holmes.utils.stream import StreamEvents, StreamMessage
 
