@@ -20,6 +20,51 @@ from tests.llm.utils.test_env_vars import (
 )
 
 
+class _CompletionsProxy:
+    def __init__(self, completions):
+        self._completions = completions
+
+    def create(self, *args, **kwargs):
+        # Some newer/reasoning models reject `max_tokens` and require `max_completion_tokens`.
+        # Be conservative: try as-is first; if the server rejects, retry with renamed param.
+        try:
+            return self._completions.create(*args, **kwargs)
+        except openai.BadRequestError as e:
+            msg = str(e)
+            if (
+                "max_tokens" in msg
+                and "max_completion_tokens" in msg
+                and "max_tokens" in kwargs
+                and "max_completion_tokens" not in kwargs
+            ):
+                retry_kwargs = dict(kwargs)
+                retry_kwargs["max_completion_tokens"] = retry_kwargs.pop("max_tokens")
+                return self._completions.create(*args, **retry_kwargs)
+            raise
+
+    def __getattr__(self, name):
+        return getattr(self._completions, name)
+
+
+class _ChatProxy:
+    def __init__(self, chat):
+        self._chat = chat
+        # Wrap only chat.completions.create, leave everything else untouched.
+        self.completions = _CompletionsProxy(chat.completions)
+
+    def __getattr__(self, name):
+        return getattr(self._chat, name)
+
+
+class _MaxTokensCompatClient:
+    def __init__(self, client):
+        self._client = client
+        self.chat = _ChatProxy(client.chat)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
 @dataclass
 class ClassifierModelParams:
     model: str
@@ -100,16 +145,16 @@ def create_llm_client():
         client = openai.OpenAI(api_key=params.api_key, base_url=params.api_base)
         model_for_api = params.model
 
-    return client, model_for_api
+    # Add compatibility shim for models that require max_completion_tokens.
+    return _MaxTokensCompatClient(client), model_for_api
 
 
 # Register client with autoevals
 try:
     client, _ = create_llm_client()
     params = get_classifier_model_params()
-    if params.is_azure:
-        wrapped = wrap_openai(client)
-        init(wrapped)  # type: ignore
+    wrapped = wrap_openai(client)
+    init(wrapped)  # type: ignore
 except Exception:
     # If client creation fails, individual tests will be skipped due to the fixture, so client = None is OK
     client = None
