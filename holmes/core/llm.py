@@ -3,7 +3,10 @@ import logging
 import os
 import threading
 from abc import abstractmethod
+from functools import lru_cache
 from math import floor
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
 
 import litellm
@@ -44,6 +47,42 @@ MODEL_LIST_FILE_LOCATION = os.environ.get(
 
 OVERRIDE_MAX_OUTPUT_TOKEN = environ_get_safe_int("OVERRIDE_MAX_OUTPUT_TOKEN")
 OVERRIDE_MAX_CONTENT_SIZE = environ_get_safe_int("OVERRIDE_MAX_CONTENT_SIZE")
+
+
+def _is_http_url(url: Optional[str]) -> bool:
+    return bool(url) and (url.startswith("http://") or url.startswith("https://"))
+
+
+def _normalize_openai_compatible_base_url(base_url: str) -> str:
+    # In this codebase base_url is typically already the OpenAI-compatible base,
+    # e.g. http://host:8000/v1 or https://.../openai/v1/
+    # Ensure it ends with a single '/'.
+    return base_url.rstrip("/") + "/"
+
+
+@lru_cache(maxsize=64)
+def _fetch_openai_compatible_models(base_url: str) -> list[dict]:
+    """Fetch OpenAI-compatible /models list.
+
+    Expected response format (vLLM-compatible):
+    {"object":"list","data":[{"id":"...","max_model_len":262144, ...}, ...]}
+
+    Returns an empty list on any failure.
+    """
+    try:
+        normalized = _normalize_openai_compatible_base_url(base_url)
+        models_url = urljoin(normalized, "models")
+        timeout_s = float(os.environ.get("REMOTE_MODEL_METADATA_TIMEOUT_SECONDS", "2"))
+        req = Request(models_url, headers={"Accept": "application/json"})
+        with urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read()
+        payload = json.loads(raw.decode("utf-8"))
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [x for x in data if isinstance(x, dict)]
+    except Exception as e:
+        logging.debug("Failed to fetch remote /models from %s: %s", base_url, e)
+    return []
 
 
 def get_context_window_compaction_threshold_pct() -> int:
@@ -161,6 +200,9 @@ class DefaultLLM(LLM):
         self.tracer = tracer
         self.name = name
         self.is_robusta_model = is_robusta_model
+        self._remote_model_metadata_lock = threading.RLock()
+        self._remote_max_model_len: Optional[int] = None
+        self._remote_model_metadata_loaded = False
         self.update_custom_args()
         self.check_llm(
             self.model, self.api_key, self.api_base, self.api_version, self.args
@@ -169,6 +211,57 @@ class DefaultLLM(LLM):
     def update_custom_args(self):
         self.max_context_size = self.args.get("custom_args", {}).get("max_context_size")
         self.args.pop("custom_args", None)
+
+    def _is_hosted_vllm_model(self) -> bool:
+        return bool(self.model) and self.model.startswith("hosted_vllm/")
+
+    def _get_openai_compatible_model_id_candidates(self) -> list[str]:
+        candidates: list[str] = []
+
+        if getattr(self, "name", None):
+            candidates.append(str(self.name))
+
+        if self.model:
+            candidates.append(self.model)
+            if "/" in self.model:
+                candidates.append(self.model.split("/", 1)[1])
+
+        # Preserve order but remove empties/duplicates
+        out: list[str] = []
+        for c in candidates:
+            if c and c not in out:
+                out.append(c)
+        return out
+
+    def _load_remote_model_metadata_if_needed(self) -> None:
+        if self._remote_model_metadata_loaded:
+            return
+        if not self._is_hosted_vllm_model():
+            self._remote_model_metadata_loaded = True
+            return
+        if not _is_http_url(self.api_base):
+            self._remote_model_metadata_loaded = True
+            return
+        if os.environ.get("ENABLE_REMOTE_MODEL_METADATA", "true").lower() == "false":
+            self._remote_model_metadata_loaded = True
+            return
+
+        with self._remote_model_metadata_lock:
+            if self._remote_model_metadata_loaded:
+                return
+
+            models = _fetch_openai_compatible_models(self.api_base)  # type: ignore[arg-type]
+            if models:
+                wanted_ids = set(self._get_openai_compatible_model_id_candidates())
+                for m in models:
+                    mid = m.get("id")
+                    if isinstance(mid, str) and mid in wanted_ids:
+                        max_len = m.get("max_model_len")
+                        if isinstance(max_len, int) and max_len > 0:
+                            self._remote_max_model_len = max_len
+                            break
+
+            self._remote_model_metadata_loaded = True
 
     def check_llm(
         self,
@@ -277,6 +370,11 @@ class DefaultLLM(LLM):
                 f"Using override OVERRIDE_MAX_CONTENT_SIZE {OVERRIDE_MAX_CONTENT_SIZE}"
             )
             return OVERRIDE_MAX_CONTENT_SIZE
+
+        # For hosted vLLM models, try reading max_model_len from the remote OpenAI-compatible /models endpoint.
+        self._load_remote_model_metadata_if_needed()
+        if self._remote_max_model_len:
+            return self._remote_max_model_len
 
         # Try each name variant
         for name in self._get_model_name_variants_for_lookup():
@@ -440,6 +538,12 @@ class DefaultLLM(LLM):
                 f"Using OVERRIDE_MAX_OUTPUT_TOKEN {OVERRIDE_MAX_OUTPUT_TOKEN}"
             )
             return OVERRIDE_MAX_OUTPUT_TOKEN
+
+        # If we have remote model metadata (hosted vLLM), the derived max_output_tokens is good enough.
+        # Avoid warning spam when LiteLLM lacks model_cost entries for hosted model names.
+        self._load_remote_model_metadata_if_needed()
+        if self._remote_max_model_len:
+            return max_output_tokens
 
         # Try each name variant
         for name in self._get_model_name_variants_for_lookup():
